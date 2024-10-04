@@ -1,0 +1,38 @@
+name: CI for Colab Notebooks
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout the repository
+      - uses: actions/checkout@v4
+
+      # Step 2: Set up Python environment (you can specify the version you need)
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      # Step 3: Install dependencies (adjust according to your notebooks)
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install jupyter nbconvert
+
+      # Step 4: Convert and run the Jupyter notebooks
+      - name: Execute notebooks
+        run: |
+          for notebook in $(find . -name "*.ipynb"); do
+            echo "Running $notebook"
+            jupyter nbconvert --to notebook --execute --inplace "$notebook"
+          done
+
+      # Optional: Add other steps like testing or deploying here
