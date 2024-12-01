@@ -238,59 +238,78 @@ def train_a3c(env, env_id='CartPole-v1', input_dims=[4], n_actions=2, n_episodes
     # gamma=0.99
 
     # env = gym.make(env_id)
+    try:
+        global_actor_critic = ActorCritic(input_dims, n_actions)
+        global_actor_critic.share_memory()
 
-    global_actor_critic = ActorCritic(input_dims, n_actions)
-    global_actor_critic.share_memory()
+        optim = SharedAdam(global_actor_critic.parameters(), lr=lr, betas=(0.92, 0.999))
 
-    optim = SharedAdam(global_actor_critic.parameters(), lr=lr, betas=(0.92, 0.999))
+        global_ep = mp.Value('i', 0)
+        # global_ep_r = mp.Value('d', 0.)
+        # result_queue = mp.Queue()
 
-    global_ep = mp.Value('i', 0)
-    # global_ep_r = mp.Value('d', 0.)
-    # result_queue = mp.Queue()
+        thread_manager = mp.Manager()
+        rewards_list = thread_manager.list()
+        
+        workers = [Agent(global_actor_critic, optim, input_dims, n_actions, gamma,
+                        lr, i,
+                        global_ep_idx=global_ep,
+                        env_id=env_id,
+                        env=env,
+                        n_episodes=n_episodes, rewards_list=rewards_list, grad_clip=grad_clip, C=C) for i in range(mp.cpu_count())]
 
-    thread_manager = mp.Manager()
-    rewards_list = thread_manager.list()
+        [w.start() for w in workers]
+        [w.join() for w in workers]
+
+
+        folder_path = 'a3c_models'
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        T.save(global_actor_critic, os.path.join(folder_path, f'a3c_model_{env_id}.pth' ))
+
+        rewards_per_ep = list(rewards_list)
+        rewards_per_episode_plot_2(rewards_per_ep=rewards_per_ep, environment_type=env_id)
+
+        if use_wandb:
+            wandb_config = {
+                'env': env_id,
+                'algorithm': 'A3C',
+                'gamma': gamma,
+                'lr': lr,
+                'num_episodes': n_episodes,
+                'input_dims': input_dims,
+                'n_actions': n_actions
+            }
+            wandb.init(project='A3_A3C', config=wandb_config, name=env_id)
+
+            for episode, reward in enumerate(rewards_list):
+                wandb.log({'episode': episode, 'reward': reward})
+
+            wandb.save(f'a3c_model_{env_id}.pth')
+
+            wandb.finish()
+
+        return rewards_list
+
+    except KeyboardInterrupt:
+        print("Training interrupted by user. Closing the environment.")
     
-    workers = [Agent(global_actor_critic, optim, input_dims, n_actions, gamma,
-                     lr, i,
-                     global_ep_idx=global_ep,
-                     env_id=env_id,
-                     env=env,
-                     n_episodes=n_episodes, rewards_list=rewards_list, grad_clip=grad_clip, C=C) for i in range(mp.cpu_count())]
-
-    [w.start() for w in workers]
-    [w.join() for w in workers]
-
-
-    folder_path = 'a3c_models'
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-
-    T.save(global_actor_critic, os.path.join(folder_path, f'a3c_model_{env_id}.pth' ))
-
-    rewards_per_ep = list(rewards_list)
-    rewards_per_episode_plot_2(rewards_per_ep=rewards_per_ep, environment_type=env_id)
-
-    if use_wandb:
-        wandb_config = {
-            'env': env_id,
-            'algorithm': 'A3C',
-            'gamma': gamma,
-            'lr': lr,
-            'num_episodes': n_episodes,
-            'input_dims': input_dims,
-            'n_actions': n_actions
-        }
-        wandb.init(project='A3_A3C', config=wandb_config, name=env_id)
-
-        for episode, reward in enumerate(rewards_list):
-            wandb.log({'episode': episode, 'reward': reward})
-
-        wandb.save(f'a3c_model_{env_id}.pth')
-
-        wandb.finish()
-
-    return rewards_list
+    except mp.TimeoutError:
+        print("Multiprocessing timeout occurred. Training incomplete.")
+    
+    except Exception as e:
+        print(f"An error occurred during training: {e}")
+    
+    finally:
+        try:
+            env.close()
+            for worker in workers:
+                worker.terminate()
+            thread_manager.shutdown()
+            print("Environment and workers cleaned up successfully.")
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
 
 def greedy_agent_a3c(model_path, env_id, n_episodes=100):
     env = gym.make(env_id)
