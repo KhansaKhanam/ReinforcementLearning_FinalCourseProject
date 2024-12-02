@@ -10,6 +10,9 @@ import matplotlib.pyplot as plt
 import os
 import wandb
 from tqdm import tqdm
+import traci
+import shutil
+import sumo_rl
 
 import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="gym")
@@ -35,6 +38,108 @@ class WanDB():
             wandb.finish()
 
 
+
+class Environment:
+    def __init__(self, env_name, route_file, net_file, out_csv_name, render_mode='human', num_seconds=100000):
+        self.env_name = env_name
+        self.use_gui = True if render_mode == 'human' else False
+        self.route_file = route_file
+        self.net_file = net_file
+        self.out_csv_name = out_csv_name
+
+        self.env = gym.make(
+                        env_name,
+                        net_file=net_file,
+                        route_file=route_file,
+                        out_csv_name=out_csv_name,
+                        use_gui=self.use_gui,
+                        num_seconds=num_seconds
+                    )
+     
+        self.state, _ = self.env.reset()
+        self.done = False
+        self.observation_space = self.env.observation_space.shape[0]
+        self.action_space = self.env.action_space
+        self.traffic_signals = self.env.traffic_signals
+    
+    def reset(self):
+        self.state, _ = self.env.reset()
+        self.done = False
+        return self.state
+    
+    def custom_reward(self, traffic_signal, reward_type='average_speed', reward_method='simple'):
+        # print("Inside custom reward method")
+        if reward_method == 'simple':
+            match reward_type:
+                case 'average_speed':
+                    return traffic_signal.get_avgerage_speed()
+                case 'congesion':
+                    return -1 * traffic_signal.get_pressure()
+                case 'emissions':
+                    return -1* traffic_signal.get_emission_co2()
+                case 'throughput':
+                    return traffic_signal.get_throughput()
+
+        else:
+            # Weighted sum of the metrics
+            reward = 0
+            if weights is None:
+                weights = {
+                    'average_speed': 0.4,
+                    'waiting_time': 0.3,
+                    'emissions': 0.2,
+                    'throughput': 0.1
+                }
+
+            # Calculate individual rewards
+            average_speed = traffic_signal.get_average_speed()
+            waiting_time = -1* traffic_signal._diff_waiting_time_reward()
+            total_queue = -1 * traffic_signal.get_total_queued()
+            congesion = traffic_signal.get_pressure()
+
+            print(average_speed, waiting_time, total_queue, congesion)
+            weighted_reward = (
+                weights['average_speed'] * average_speed +
+                weights['waiting_time'] * waiting_time +
+                weights['emissions'] * total_queue +
+                weights['throughput'] * congesion
+            )
+
+            return weighted_reward
+            
+            
+    def step(self, action):
+        # print("Inside step method")
+        next_state, reward, terminated, truncated, info = self.env.step(action)
+        # print("Step taken", next_state, terminated, truncated, info)
+
+        # print("Traffic signals:", list(self.traffic_signals.values())[0])
+        # traffic_signal = list(self.traffic_signals.values())[0]
+        # print("Pressure:", traffic_signal.get_pressure())
+        # # print(traffic_signal.get_average_speed(), traffic_signal.get_total_queued(), traffic_signal._diff_waiting_time_reward(), traffic_signal.get_pressure())
+        # reward = self.custom_reward(traffic_signal, reward_type='congesion', reward_method='simple')
+        # print("Reward:", reward)
+
+        self.state = next_state
+        self.done = terminated
+        return next_state, reward, self.done or truncated
+    
+    def render(self):
+        self.env.render()
+    
+    def close(self):
+        try:
+            self.env.close()
+            if traci.isLoaded():
+                traci.close()
+            print("Env and Traci closed successfully.")
+        except Exception as e:
+            print("Error while closing the environment:", e)
+    
+    def get_state(self):
+        return self.state
+
+
 class SharedAdam(T.optim.Adam):
     def __init__(self, params, lr = 0.001, betas = (0.9, 0.99), eps = 1e-8, weight_decay = 0):
         super(SharedAdam, self).__init__(params, lr, betas, eps, weight_decay)
@@ -49,9 +154,12 @@ class SharedAdam(T.optim.Adam):
                 state['exp_avg'].share_memory_()
                 state['exp_avg_sq'].share_memory_()
 
+
 class ActorCritic(nn.Module):
     def __init__(self, input_dims, n_actions, gamma=0.99):
         super(ActorCritic, self).__init__()
+
+        # print("Inside ActorCritic class", input_dims, n_actions)
 
         self.gamma = gamma
 
@@ -134,65 +242,80 @@ class ActorCritic(nn.Module):
     
 
 class Agent(mp.Process):
-    def __init__(self, global_actor_critic, optimizer, input_dims, n_actions, gamma, lr, name, global_ep_idx, env_id, env, n_episodes, rewards_list, C=5, grad_clip=5):
+    def __init__(self, global_actor_critic, optimizer, input_dims, n_actions, gamma, lr, name, global_ep_idx, env_id, env,
+                  n_episodes, rewards_list, C=5, grad_clip=5, num_seconds=1000, nets_file=None, routes_file=None, out_csv_name=None):
         super(Agent, self).__init__()
 
+        self.env_id = env_id
         self.local_actor_critic = ActorCritic(input_dims, n_actions, gamma)
         self.global_actor_critic = global_actor_critic
 
         self.name = "w%02i" % name
         self.episode_idx = global_ep_idx
-        if env is None:
-            self.env = gym.make(env_id)
-        else:
-            self.env = env
+        self.env_params = {
+            'net_file': nets_file,
+            'route_file': routes_file,
+            'out_csv_name': out_csv_name,
+            'render_mode': None,
+            'num_seconds': num_seconds
+        }
+
         self.optimizer = optimizer
         self.n_episodes = n_episodes
         self.rewards_list = rewards_list
         self.C = C
         self.grad_clip = grad_clip
+        
 
     def run(self):
         t_step = 1
         max_steps = 5
 
         rewards_per_eps = {}
-        
-        while self.episode_idx.value < self.n_episodes:
-            terminated = False
-            observation, info = self.env.reset()
-            score = 0
-            self.local_actor_critic.clear_mem()
 
-            while not terminated:
-                action = self.local_actor_critic.choose_action(observation)
-                obs, reward, terminated, truncated, info = self.env.step(action)
-                score += reward
-                self.local_actor_critic.store_in_mem(observation, action, reward)
+        self.env = Environment('sumo-rl-v0', **self.env_params)
+        try:
+            while self.episode_idx.value < self.n_episodes:
+                terminated = False
+                observation  = self.env.reset()
 
-                if t_step % self.C == 0 or terminated:
-                    loss = self.local_actor_critic.calc_loss(terminated)
-                    self.optimizer.zero_grad()
-                    loss.backward()
+                score = 0
+                self.local_actor_critic.clear_mem()
 
-                    T.nn.utils.clip_grad_norm_(self.local_actor_critic.parameters(), self.grad_clip)
+                while not terminated:
+                    action = self.local_actor_critic.choose_action(observation)
+                    obs, reward, terminated = self.env.step(action)
+                    score += reward
+                    self.local_actor_critic.store_in_mem(observation, action, reward)
 
-                    for local_param, global_param in zip(self.local_actor_critic.parameters(), self.global_actor_critic.parameters()):
-                        global_param._grad = local_param.grad
+                    if t_step % self.C == 0 or terminated:
+                        loss = self.local_actor_critic.calc_loss(terminated)
+                        self.optimizer.zero_grad()
+                        loss.backward()
 
-                    self.optimizer.step()
-                    self.local_actor_critic.load_state_dict(self.global_actor_critic.state_dict())
+                        T.nn.utils.clip_grad_norm_(self.local_actor_critic.parameters(), self.grad_clip)
 
-                    self.local_actor_critic.clear_mem()
+                        for local_param, global_param in zip(self.local_actor_critic.parameters(), self.global_actor_critic.parameters()):
+                            global_param._grad = local_param.grad
+
+                        self.optimizer.step()
+                        self.local_actor_critic.load_state_dict(self.global_actor_critic.state_dict())
+
+                        self.local_actor_critic.clear_mem()
+                    
+                    t_step += 1
+                    observation = obs
+
+                with self.episode_idx.get_lock():
+                    self.rewards_list.append(score)
+                    self.episode_idx.value += 1
                 
-                t_step += 1
-                observation = obs
-
-            with self.episode_idx.get_lock():
-                self.rewards_list.append(score)
-                self.episode_idx.value += 1
-            
-            print(self.name, "Episode", self.episode_idx.value, "reward %.1f" % score, flush=True)
+                print(self.name, "Episode", self.episode_idx.value, "reward %.1f" % score, flush=True)
+        except Exception as e:
+            print(f"Worker {self.name} encountered error: {e}")
+        finally:
+            if hasattr(self, 'env'):
+                self.env.close()
 
 def rewards_per_episode_plot_2(rewards_per_ep, environment_type, epsilons=None, window_size=10):
     """
@@ -232,12 +355,17 @@ def rewards_per_episode_plot_2(rewards_per_ep, environment_type, epsilons=None, 
     plt.show()
     # return plt
 
-def train_a3c(env, env_id='CartPole-v1', input_dims=[4], n_actions=2, n_episodes=5000, gamma=0.99, use_wandb=False, grad_clip=0.5, C=5, lr=1e-4):
+def train_a3c(env, input_files, env_id='CartPole-v1', input_dims=[4], n_actions=2, n_episodes=5000, gamma=0.99, use_wandb=False, grad_clip=0.5, C=5, lr=1e-4):
     print("Training started...", flush=True)
+    
     # env_id = 'CartPole-v1'
     # gamma=0.99
 
     # env = gym.make(env_id)
+    nets_file = input_files['nets_file']
+    routes_file = input_files['routes_file']
+    out_csv_name = input_files['out_csv_name']
+
     try:
         global_actor_critic = ActorCritic(input_dims, n_actions)
         global_actor_critic.share_memory()
@@ -255,8 +383,13 @@ def train_a3c(env, env_id='CartPole-v1', input_dims=[4], n_actions=2, n_episodes
                         lr, i,
                         global_ep_idx=global_ep,
                         env_id=env_id,
-                        env=env,
-                        n_episodes=n_episodes, rewards_list=rewards_list, grad_clip=grad_clip, C=C) for i in range(mp.cpu_count())]
+                        env=None,
+                        n_episodes=n_episodes, 
+                        rewards_list=rewards_list, 
+                        grad_clip=grad_clip, C=C, 
+                        nets_file=nets_file, 
+                        routes_file=routes_file, 
+                        out_csv_name=out_csv_name) for i in range(mp.cpu_count())]
 
         [w.start() for w in workers]
         [w.join() for w in workers]
@@ -300,12 +433,14 @@ def train_a3c(env, env_id='CartPole-v1', input_dims=[4], n_actions=2, n_episodes
     
     except Exception as e:
         print(f"An error occurred during training: {e}")
+        return []
     
     finally:
         try:
             env.close()
             for worker in workers:
-                worker.terminate()
+                if worker.is_alive():
+                    worker.terminate()
             thread_manager.shutdown()
             print("Environment and workers cleaned up successfully.")
         except Exception as e:
@@ -316,7 +451,7 @@ def greedy_agent_a3c(model_path, env_id, n_episodes=100):
     # model = ActorCritic(env.observation_space.shape, env.action_space.n)
     # model.load_state_dict(T.load(model_path))
     # model.eval()
-
+    mp.set_start_method('spawn')
     model = T.load(model_path)
     model.eval()
 
@@ -355,39 +490,80 @@ def greedy_agent_a3c(model_path, env_id, n_episodes=100):
 
 
 if __name__ == "__main__":
-    lr = 1e-4
-    env_id = 'CartPole-v1'
+    n_episodes = 700
+    batch_size = 64
+    epsilon = 1
+    gamma = 0.99
+    learning_rate = 1e-3
+    epsilon_decay = 0.995
 
-    n_actions = 2
-    input_dims = [4]
-    n_episodes = 3000
-    gamma=0.99
-    T_MAX = 5
-    N_EPISODES = 5000
+    C = 10
+    num_seconds = 500
+
+    nets_dir = 'nets'
+
+    file_name = 'single_intersection_simple'
+    env_id = f'sumo-rl-v0-{file_name}'
+
+
+    nets_file = os.path.join(nets_dir, f'{file_name}.net.xml')
+    routes_file = os.path.join(nets_dir, f'{file_name}.rou.xml')
+    out_csv_name = os.path.join(nets_dir+"/a3c_results_csv", f'{file_name}.passenger.csv')
+
+    file_exists = lambda file_path: os.path.exists(file_path)
+
+    results_dir = os.path.join(nets_dir, 'a3c_results_csv')
+    if os.path.exists(results_dir):
+        shutil.rmtree(results_dir)
+    os.makedirs(results_dir, exist_ok=True)
+
+    if not file_exists(nets_file):
+        raise FileNotFoundError(f"Net file not found: {nets_file}")
+    if not file_exists(routes_file):
+        raise FileNotFoundError(f"Route file not found: {routes_file}")
+
+    sumo_env = Environment('sumo-rl-v0', net_file=nets_file, route_file=routes_file, out_csv_name=out_csv_name, render_mode=None, num_seconds=num_seconds)
+
+
+    print("Observation Space:", sumo_env.observation_space)
+    print("Action Space:", sumo_env.action_space)
+    print("Initial State:", sumo_env.state)
+
+    input_dims = [sumo_env.observation_space]
+    n_actions = sumo_env.action_space.n
 
     global_actor_critic = ActorCritic(input_dims, n_actions)
     global_actor_critic.share_memory()
 
-    optim = SharedAdam(global_actor_critic.parameters(), lr=lr, betas=(0.92, 0.999))
+    optim = SharedAdam(global_actor_critic.parameters(), lr=learning_rate, betas=(0.92, 0.999))
 
     global_ep = mp.Value('i', 0)
     thread_manager = mp.Manager()
     rewards_list = thread_manager.list()
 
-    workers = [Agent(global_actor_critic, optim, input_dims, n_actions, gamma,
-                     lr, i,
-                     global_ep_idx=global_ep,
-                     env_id=env_id,
-                     n_episodes=n_episodes, rewards_list=rewards_list) for i in range(mp.cpu_count())]
+    input_files = {
+        'nets_file': nets_file,
+        'routes_file': routes_file,
+        'out_csv_name': out_csv_name
+    }
 
-    [w.start() for w in workers]
-    [w.join() for w in workers]
+    rewards_per_episode = train_a3c(env=None, env_id=env_id, input_dims=input_dims, n_actions=n_actions, 
+                                    n_episodes=n_episodes, gamma=gamma, use_wandb=False, grad_clip=0.5, C=5, lr=1e-4, input_files=input_files)
 
-    # Save the model
-    T.save(global_actor_critic, f'a3c_model_{env_id}.pth')
+    # workers = [Agent(global_actor_critic, optim, input_dims, n_actions, gamma, env=sumo_env
+    #                  learning_rate, i,
+    #                  global_ep_idx=global_ep,
+    #                  env_id=env_id,
+    #                  n_episodes=n_episodes, rewards_list=rewards_list) for i in range(mp.cpu_count())]
 
-    rewards_per_ep = list(rewards_list)
-    rewards_per_episode_plot_2(rewards_per_ep=rewards_per_ep, environment_type='CartPole-v1')
+    # [w.start() for w in workers]
+    # [w.join() for w in workers]
+
+    # # Save the model
+    # T.save(global_actor_critic, f'a3c_model_{env_id}.pth')
+
+    # rewards_per_ep = list(rewards_list)
+    rewards_per_episode_plot_2(rewards_per_ep=rewards_per_episode, environment_type=env_id)
 
 
 
