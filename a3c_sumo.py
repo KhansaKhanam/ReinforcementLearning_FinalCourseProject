@@ -327,8 +327,10 @@ def rewards_per_episode_plot_2(rewards_per_ep, environment_type, epsilons=None, 
         epsilons (list, optional): Epsilon values per episode, if you'd like to include them in the plot. Default is None.
         window_size (int, optional): The window size for moving average smoothing. Default is 10.
     """
-    episodes = np.arange(len(rewards_per_ep))
-    rewards = np.array(rewards_per_ep).flatten()
+    # episodes = np.arange(len(rewards_per_ep))
+    # rewards = np.array(rewards_per_ep).flatten()
+    episodes = np.array(list(rewards_per_ep.keys())).flatten()
+    rewards = np.array(list(rewards_per_ep.values())).flatten()
 
     plt.figure(figsize=(10, 6))
     plt.plot(episodes, rewards, marker='o', linestyle='-', markersize=4, label='Rewards per Episode')
@@ -446,15 +448,16 @@ def train_a3c(env, input_files, env_id='CartPole-v1', input_dims=[4], n_actions=
         except Exception as e:
             print(f"Error during cleanup: {e}")
 
-def greedy_agent_a3c(model_path, env_id, n_episodes=100):
-    env = gym.make(env_id)
+def greedy_agent_a3c(model_path, env_params, n_episodes=100):
+    env = Environment('sumo-rl-v0', **env_params)
     # model = ActorCritic(env.observation_space.shape, env.action_space.n)
     # model.load_state_dict(T.load(model_path))
     # model.eval()
-    mp.set_start_method('spawn')
+    # mp.set_start_method('spawn')
     model = T.load(model_path)
     model.eval()
 
+    print("Evaluating the model...", flush=True)
 
     reward_list = []
     rewards_per_episode = {}
@@ -462,7 +465,7 @@ def greedy_agent_a3c(model_path, env_id, n_episodes=100):
     p_bar = tqdm(range(n_episodes), colour='red', desc='Testing Progress', unit='Episode')
 
     for episode in p_bar:
-        observation, _ = env.reset()
+        observation = env.reset()
         done = False
         episode_reward = 0
 
@@ -472,8 +475,7 @@ def greedy_agent_a3c(model_path, env_id, n_episodes=100):
                 pi, _ = model(state)
                 action = T.argmax(pi).item()  # Choose the action with highest probability
 
-            observation, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
+            observation, reward, done = env.step(action)
             episode_reward += reward
 
         reward_list.append(episode_reward)
