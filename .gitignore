@@ -2,3 +2,4 @@
 /nets/ddqn_results_csv/*
 /nets/a3c_results_csv/*
 # *.csv
+/nets/two_way/*
