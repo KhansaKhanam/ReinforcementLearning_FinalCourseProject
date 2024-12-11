@@ -403,9 +403,12 @@ def train_a3c(env, input_files, env_id='CartPole-v1', input_dims=[4], n_actions=
 
         T.save(global_actor_critic, os.path.join(folder_path, f'a3c_model_{env_id}.pth' ))
 
-        T.save(rewards_per_ep, os.path.join('saved_variables', f'a3c_rewards_per_episode.pth'))
+        print(rewards_list)
         rewards_per_ep = list(rewards_list)
-        rewards_per_episode_plot_2(rewards_per_ep=rewards_per_ep, environment_type=env_id)
+        T.save(rewards_per_ep, os.path.join('saved_variables', f'a3c_rewards_per_episode.pth'))
+        
+        print(rewards_per_ep)
+        # rewards_per_episode_plot_2(rewards_per_ep=rewards_per_ep, environment_type=env_id)
 
 
         if use_wandb:
