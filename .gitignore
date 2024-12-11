@@ -3,3 +3,5 @@
 /nets/a3c_results_csv/*
 # *.csv
 /nets/two_way/*
+wandb/*
+__pycache__/a3c_sumo.cpython-310.pyc
